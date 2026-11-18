@@ -1,4 +1,4 @@
-// The token radar's model (radar-2): one snapshot in, one ranked board out. Standard library only.
+// The token radar's model (radar-3): one snapshot in, one ranked board out. Standard library only.
 //
 // A protocol is "pre-token" when the snapshot records no token for it (no market cap, no CoinGecko id,
 // no symbol). The board ranks pre-token protocols by an implied launch value, and keeps the protocols
@@ -9,8 +9,12 @@
 //   comparable   = per category, the median of mcap / TVL (each held to 0.03 .. 1.5) over live-token
 //                  protocols of that category, shrunk toward the median of all of them (K = 8
 //                  pseudo-peers) when the category has few, and held to 0.08 .. 1.0
-//   implied      = TVL x comparable x growth x quiet-time x reach
-//   growth       = 1 + 0.5 x clamp(change_7d, -50, +100) / 100              (0.75 .. 1.50)
+//   implied      = TVL x comparable x size x growth x quiet-time x reach
+//   size         = (TVL / median comparable TVL) ^ slope, held to 0.35 .. 1.6, where slope is the least-
+//                  squares slope of ln(mcap / TVL) on ln(TVL) over the same comparables, held to -0.45 .. 0:
+//                  the market pays less per dollar of TVL the bigger the protocol is, and the comparables'
+//                  own multiples are divided by that effect first, so it is counted once
+//   growth      = 1 + 0.5 x clamp(change_7d, -50, +100) / 100              (0.75 .. 1.50)
 //   quiet-time   = 0.7 + 0.5 x min(age, 730) / 730 - 0.25 x clamp((age - 1095) / 1095, 0, 1)
 //                  age is the days DefiLlama has tracked the protocol with no token (unknown: 540)
 //   reach        = 1 + 0.03 x min(chains - 1, 5)                            (1.00 .. 1.15)
@@ -50,6 +54,9 @@ export const MODEL = {
   comp_shrink_peers: 8,
   multiple_floor: 0.08,
   multiple_cap: 1,
+  size_slope_floor: -0.45,
+  size_mult_floor: 0.35,
+  size_mult_cap: 1.6,
   growth_weight: 0.5,
   growth_floor: -50,
   growth_cap: 100,
@@ -65,7 +72,7 @@ export const MODEL = {
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many pre-token protocols below the watchlist floor the early radar adds, by TVL. */
 export const EARLY_ROWS = 160;
@@ -108,6 +115,7 @@ export interface BoardRow {
   model: {
     category_multiple: number;
     comp_peers: number;
+    size_multiplier: number;
     growth_multiplier: number;
     quiet_time_multiplier: number;
     reach_multiplier: number;
@@ -137,6 +145,8 @@ export interface RadarData {
   model_version: string;
   model: typeof MODEL;
   global_multiple: number;
+  size_slope: number;
+  size_ref_tvl: number;
   watchlist_size: number;
   protocol_count: number;
   pre_token_count: number;
@@ -195,11 +205,25 @@ export function isCandidate(p: SnapshotProtocol): boolean {
 }
 
 /** The comparables: per category, what live-token protocols are worth per dollar of TVL. */
-export function buildComps(snapshot: Snapshot): { global: number; comps: Map<string, Comp>; live: SnapshotProtocol[] } {
+export function buildComps(snapshot: Snapshot): { global: number; comps: Map<string, Comp>; live: SnapshotProtocol[]; slope: number; refTvl: number } {
   const live = snapshot.protocols.filter((p) => !isPreToken(p) && p.mcap_usd !== null && p.mcap_usd > 0);
   const usable = live.filter((p) => p.tvl_usd >= MODEL.comp_min_tvl_usd && p.category !== null && p.category !== 'CEX');
   // One peer's ratio is held inside a band, so a single outlier cannot set a whole category's multiple.
-  const ratio = (p: SnapshotProtocol): number => clamp(p.mcap_usd! / p.tvl_usd, MODEL.comp_ratio_floor, MODEL.comp_ratio_cap);
+  const raw = (p: SnapshotProtocol): number => clamp(p.mcap_usd! / p.tvl_usd, MODEL.comp_ratio_floor, MODEL.comp_ratio_cap);
+  // The size effect: the least-squares slope of ln(ratio) on ln(TVL) over all comparables.
+  const refTvl = usable.length > 0 ? median(usable.map((p) => p.tvl_usd)) : MODEL.comp_min_tvl_usd;
+  let slope = 0;
+  if (usable.length >= 8) {
+    const xs = usable.map((p) => Math.log(p.tvl_usd / refTvl));
+    const ys = usable.map((p) => Math.log(raw(p)));
+    const mx = xs.reduce((a, b) => a + b, 0) / xs.length;
+    const my = ys.reduce((a, b) => a + b, 0) / ys.length;
+    const sxx = xs.reduce((a, x) => a + (x - mx) ** 2, 0);
+    const sxy = xs.reduce((a, x, i) => a + (x - mx) * (ys[i]! - my), 0);
+    slope = sxx > 0 ? clamp(sxy / sxx, MODEL.size_slope_floor, 0) : 0;
+  }
+  // A comparable's ratio with the size effect taken out: what it would trade at, at the median size.
+  const ratio = (p: SnapshotProtocol): number => raw(p) / Math.pow(p.tvl_usd / refTvl, slope);
   const ratios = usable.map(ratio);
   const global = ratios.length > 0 ? median(ratios) : 0.5;
   const groups = new Map<string, SnapshotProtocol[]>();
@@ -211,7 +235,12 @@ export function buildComps(snapshot: Snapshot): { global: number; comps: Map<str
     const examples = [...peers].sort((a, b) => b.mcap_usd! - a.mcap_usd! || byText(a.slug, b.slug)).slice(0, 3).map((p) => p.name);
     comps.set(category, { category, peers: peers.length, median: round4(med), multiple: round4(clamp(shrunk, MODEL.multiple_floor, MODEL.multiple_cap)), examples });
   }
-  return { global: round4(clamp(global, MODEL.multiple_floor, MODEL.multiple_cap)), comps, live };
+  return { global: round4(clamp(global, MODEL.multiple_floor, MODEL.multiple_cap)), comps, live, slope: round4(slope), refTvl };
+}
+
+/** The size multiplier for a TVL: below the comparables' median size a protocol earns more per dollar, above it less. */
+export function sizeMultiplier(tvl: number, refTvl: number, slope: number): number {
+  return clamp(Math.pow(Math.max(tvl, 1) / refTvl, slope), MODEL.size_mult_floor, MODEL.size_mult_cap);
 }
 
 /** The growth multiplier for a seven-day TVL change in per cent. */
@@ -291,25 +320,49 @@ function actionsFor(p: SnapshotProtocol, capital: number, chain: string): [strin
 }
 
 /** A farm plan: seven steps, each with a cost and a time, derived from the protocol's own record. */
-export function farmPlan(p: SnapshotProtocol, age: number | null): { plan: FarmStep[]; capital: number; gas: number; days: number } {
-  const chain = p.chains.length > 0 ? p.chains[0]! : 'its main chain';
+export function farmPlan(p: SnapshotProtocol, age: number | null, peers: Comp | undefined): { plan: FarmStep[]; capital: number; gas: number; days: number; chain: string } {
+  // The cheapest of the chains the protocol counts TVL on is where the plan runs; ties keep the listed order.
+  const chain = p.chains.length > 0 ? p.chains.reduce((best, c) => (gasPerTx(c) < gasPerTx(best) ? c : best)) : 'its main chain';
   const g = gasPerTx(chain);
   const capital = capitalFor(p.tvl_usd);
   const days = holdDaysFor(age);
   const weeks = Math.ceil(days / 7);
   const [open, second] = actionsFor(p, capital, chain);
   const weekly = g * 2;
-  const total = g * 6 + weekly * weeks;
+  const move = p.change_7d;
+  const where = chain === p.chains[0] || p.chains.length < 2 ? `on ${chain}` : `on ${chain}, the cheapest of its ${p.chains.length} chains`;
+  const peerText = peers === undefined ? `Its category has no live token to compare with, so no price is implied by a peer.` : `Live ${p.category} protocols such as ${peers.examples[0]} trade near ${(peers.median * 100).toFixed(0)}% of their TVL, which is the range this board prices ${p.name} in.`;
+  // The signal step reads the protocol's own record: its growth, its age and its size decide what to look for first.
+  const momentum = move === null
+    ? `DefiLlama reports no seven-day change for ${p.name}, so look at its TVL chart yourself before you deposit.`
+    : move >= 15
+      ? `TVL is up ${move.toFixed(0)}% in a week, which usually means an incentive programme is running: look for a live points page, and expect deposit caps.`
+      : move <= -15
+        ? `TVL is down ${Math.abs(move).toFixed(0)}% in a week: find out why (an exploit, a campaign that ended) before any money goes in.`
+        : `TVL is steady (${move >= 0 ? '+' : ''}${move.toFixed(1)}% in a week), so there is no campaign rush: enter at your own pace.`;
+  const maturity = age === null
+    ? ''
+    : age < 180
+      ? ` It has been tracked only ${Math.max(1, Math.round(age / 30))} months: early users are what first snapshots tend to reward, so start in the first week.`
+      : age > 730
+        ? ` It has been tracked ${(age / 365).toFixed(1)} years with no token: any reward would likely favour long-time users, so a late start earns little extra.`
+        : '';
+  const scale = p.tvl_usd >= 1_000_000_000
+    ? `At ${p.tvl_usd >= 1e10 ? '$10B' : `$${(p.tvl_usd / 1e9).toFixed(1)}B`} of TVL, ${usd(capital)} is a rounding error, so only a per-wallet rule can reward it: cover several features, not more money.`
+    : `With $${Math.max(1, Math.round(p.tvl_usd / 1e6))}M of TVL, ${usd(capital)} is still a small position: a reward that scales with dollars pays little, so favour what counts wallets and actions.`;
   const plan: FarmStep[] = [
-    { text: `Open a wallet used only for this, with the seed phrase kept offline. Fund it with ${usd(capital)} and a gas reserve of ${usd(g * 10)} on ${chain}.`, cost: `${usd(g * 2)} of gas to fund it`, time: '10 minutes' },
-    { text: `Reach ${p.name} through the link on its DefiLlama listing, not a search ad. Read what its docs say counts toward rewards, and whether it runs a points page.`, cost: 'nothing', time: '20 minutes' },
+    { text: `Open a wallet used only for this, with the seed phrase kept offline. Fund it with ${usd(capital)} and a gas reserve of ${usd(g * 10)} ${where}.`, cost: `${usd(g * 2)} of gas to fund it`, time: '10 minutes' },
+    { text: `Reach ${p.name} through the link on its DefiLlama listing, not a search ad. Read what its docs say counts toward rewards. ${peerText}`, cost: 'nothing', time: '20 minutes' },
+    { text: `${momentum}${maturity} ${scale}`, cost: 'nothing', time: '10 minutes' },
     { text: open, cost: `${usd(capital)} of capital and ${usd(g * 3)} of gas`, time: '15 minutes' },
     { text: second, cost: `about ${usd(g * 3)} of gas`, time: '15 minutes' },
+    ...(p.chains.length >= 3 ? [{ text: `${p.name} counts TVL on ${p.chains.length} chains. Make one small deposit of about ${usd(capital / 10)} on a second chain it supports, so the wallet is seen across chains.`, cost: `about ${usd(g * 4)} of gas, plus a bridge fee of a few dollars`, time: '20 minutes' }] : []),
     { text: `Make one qualifying action a week for ${weeks} weeks: a deposit, a swap, a vote or a claim of the protocol's own points.`, cost: `${usd(weekly)} of gas a week, ${usd(weekly * weeks)} in all`, time: '10 minutes a week' },
     { text: `Hold the position for ${days} days, so it sits inside more than one snapshot. Withdraw only after the window, or after the protocol publishes a snapshot date.`, cost: `${usd(capital)} stays at risk, and earns the pool's own yield`, time: `${days} days` },
     { text: `Revoke token approvals when done, never sign a claim from a link in a message, and keep a log of each transaction. One wallet is the plan: splitting it across many wallets is what reward filters look for.`, cost: `${usd(g)} of gas to revoke`, time: '15 minutes' },
   ];
-  return { plan, capital, gas: Math.round(total * 100) / 100, days };
+  const total = g * (plan.length - 1) + weekly * weeks;
+  return { plan, capital, gas: Math.round(total * 100) / 100, days, chain };
 }
 
 /** A step as one string within the gate's 20 to 600 characters: its action, then its cost and time. */
@@ -320,7 +373,7 @@ export function stepText(step: FarmStep): string {
 
 /** The ranked board and the data the dashboard renders, from one snapshot. */
 export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData } {
-  const { global, comps, live } = buildComps(snapshot);
+  const { global, comps, live, slope, refTvl } = buildComps(snapshot);
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const watch = new Set(snapshot.watchlist);
   const chosen = new Map<string, SnapshotProtocol>();
@@ -340,18 +393,19 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     const age = ageDays(snapshot.as_of, p.listed_at);
     const comp = p.category === null ? undefined : comps.get(p.category);
     const multiple = comp === undefined ? global : comp.multiple;
+    const size = sizeMultiplier(p.tvl_usd, refTvl, slope);
     const growth = growthMultiplier(p.change_7d);
     const quiet = quietTimeMultiplier(age);
     const reach = reachMultiplier(p.chains.length);
-    const implied = Math.max(1, Math.round(p.tvl_usd * multiple * growth * quiet * reach));
-    return { p, age, comp, multiple, growth, quiet, reach, implied };
+    const implied = Math.max(1, Math.round(p.tvl_usd * multiple * size * growth * quiet * reach));
+    return { p, age, comp, multiple, size, growth, quiet, reach, implied };
   });
   scored.sort((a, b) => b.implied - a.implied || byText(a.p.slug, b.p.slug));
 
   const board: BoardRow[] = [];
   const rows: RadarData['rows'] = [];
   scored.forEach((s, i) => {
-    const farm = farmPlan(s.p, s.age);
+    const farm = farmPlan(s.p, s.age, s.comp);
     const row = {
       rank: i + 1,
       slug: s.p.slug,
@@ -370,6 +424,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       model: {
         category_multiple: s.multiple,
         comp_peers: s.comp?.peers ?? 0,
+        size_multiplier: round4(s.size),
         growth_multiplier: round4(s.growth),
         quiet_time_multiplier: round4(s.quiet),
         reach_multiplier: round4(s.reach),
@@ -393,6 +448,8 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     model_version: MODEL_VERSION,
     model: MODEL,
     global_multiple: global,
+    size_slope: slope,
+    size_ref_tvl: Math.round(refTvl),
     watchlist_size: snapshot.watchlist.length,
     protocol_count: snapshot.protocols.length,
     pre_token_count: snapshot.protocols.filter(isPreToken).length,

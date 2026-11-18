@@ -176,6 +176,7 @@
       '<div class="card"><h3>How the value is built</h3>' +
       factor('TVL', money(r.tvl_usd), 'The protocol\'s own total value locked in the snapshot.', 1) +
       factor('x Category multiple', x(m.category_multiple), comp ? 'Live ' + esc(r.category) + ' protocols trade at a median ' + x(comp.median) + ' of TVL across ' + comp.peers + (comp.peers === 1 ? ' peer' : ' peers') + ' (' + esc(comp.examples.join(', ')) + '), shrunk toward the all-category median ' + x(R.global_multiple) + (comp.peers < 3 ? ', and pulled hard toward it because the category is thin' : '') + '.' : 'No live peers in this category: the all-category median ' + x(R.global_multiple) + ' applies.', m.category_multiple / M.multiple_cap) +
+      factor('x Size', x(m.size_multiplier), 'The market pays less per dollar of TVL the bigger a protocol is: across the live comparables the slope is ' + R.size_slope.toFixed(2) + ' in logs, around a median size of ' + money(R.size_ref_tvl) + '. Held between ' + x(M.size_mult_floor) + ' and ' + x(M.size_mult_cap) + '.', (m.size_multiplier - M.size_mult_floor) / (M.size_mult_cap - M.size_mult_floor)) +
       factor('x Growth', x(m.growth_multiplier), growthText, (m.growth_multiplier - 0.75) / 0.75) +
       factor('x Quiet time', x(m.quiet_time_multiplier), quietText, (m.quiet_time_multiplier - 0.45) / 0.75) +
       factor('x Reach', x(m.reach_multiplier), r.chains.length + ' chains counted: each extra chain adds ' + (M.reach_step * 100) + '%, up to ' + M.reach_max_extra_chains + ' extra.', (m.reach_multiplier - 1) / 0.15) +
@@ -190,8 +191,9 @@
   function modelView() {
     $('view').innerHTML =
       '<div class="cols"><div><div class="card"><h3>The model, ' + esc(R.model_version) + '</h3>' +
-      '<div class="formula">implied = TVL<br>&nbsp;&nbsp;x category multiple<br>&nbsp;&nbsp;x growth<br>&nbsp;&nbsp;x quiet time<br>&nbsp;&nbsp;x reach</div>' +
-      '<p class="note"><b>Category multiple:</b> the median of market cap / TVL over live-token protocols of the same category with at least ' + money(M.comp_min_tvl_usd) + ' of TVL, shrunk toward the all-category median (' + x(R.global_multiple) + ') by ' + M.comp_shrink_peers + ' pseudo-peers, and held between ' + x(M.multiple_floor) + ' and ' + x(M.multiple_cap) + '.</p>' +
+      '<div class="formula">implied = TVL<br>&nbsp;&nbsp;x category multiple<br>&nbsp;&nbsp;x size<br>&nbsp;&nbsp;x growth<br>&nbsp;&nbsp;x quiet time<br>&nbsp;&nbsp;x reach</div>' +
+      '<p class="note"><b>Category multiple:</b> the median of market cap / TVL, at the median size, over live-token protocols of the same category with at least ' + money(M.comp_min_tvl_usd) + ' of TVL, shrunk toward the all-category median (' + x(R.global_multiple) + ') by ' + M.comp_shrink_peers + ' pseudo-peers, and held between ' + x(M.multiple_floor) + ' and ' + x(M.multiple_cap) + '.</p>' +
+      '<p class="note"><b>Size:</b> (TVL / ' + money(R.size_ref_tvl) + ') ^ ' + R.size_slope.toFixed(2) + ', the least-squares slope of ln(market cap / TVL) on ln(TVL) over the live comparables, held between ' + x(M.size_mult_floor) + ' and ' + x(M.size_mult_cap) + '. Each comparable\'s own multiple has this effect divided out first, so it is counted once.</p>' +
       '<p class="note"><b>Growth:</b> 1 + ' + M.growth_weight + ' x the seven-day TVL change, held between ' + M.growth_floor + '% and +' + M.growth_cap + '%, so 0.75x to 1.50x.</p>' +
       '<p class="note"><b>Quiet time:</b> ' + M.quiet_floor + ' + ' + M.quiet_gain + ' x min(age, ' + M.quiet_ramp_days + ') / ' + M.quiet_ramp_days + ', less up to ' + M.quiet_decay + ' once the age passes ' + M.quiet_decay_start_days + ' days, where age is the days DefiLlama has tracked the protocol with no token. This shape is an assumption, not a measurement.</p>' +
       '<p class="note"><b>Reach:</b> 1 + ' + M.reach_step + ' per extra chain, up to ' + M.reach_max_extra_chains + ' extra.</p></div>' +
